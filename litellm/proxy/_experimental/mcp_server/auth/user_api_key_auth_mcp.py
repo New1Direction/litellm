@@ -219,8 +219,13 @@ class MCPRequestHandler:
             # An explicit x-litellm-api-key is always a LiteLLM credential, even
             # for a delegated server, so validate it: identity / spend / rate
             # limits resolve and any stored upstream token can be forwarded.
+            # Pass the key as custom_litellm_key_header so it is read with the
+            # same lenient extraction the header gets under FastAPI dependency
+            # injection (a raw, un-prefixed key is accepted); routing it through
+            # the positional api_key would apply strict Bearer parsing and empty
+            # a valid raw key, failing the call.
             validated_user_api_key_auth = await user_api_key_auth(
-                api_key=litellm_api_key, request=request
+                custom_litellm_key_header=litellm_api_key, request=request
             )
         elif MCPRequestHandler._target_servers_delegate_auth_to_upstream(
             path=request_route,
@@ -247,7 +252,7 @@ class MCPRequestHandler:
             client_ip = IPAddressUtils.get_mcp_client_ip(request)
             try:
                 validated_user_api_key_auth = await user_api_key_auth(
-                    api_key=litellm_api_key, request=request
+                    custom_litellm_key_header=litellm_api_key, request=request
                 )
             except (HTTPException, ProxyException) as e:
                 # ProxyException.code is normalized to str (possibly "None"), so
@@ -278,7 +283,7 @@ class MCPRequestHandler:
         else:
             try:
                 validated_user_api_key_auth = await user_api_key_auth(
-                    api_key=litellm_api_key, request=request
+                    custom_litellm_key_header=litellm_api_key, request=request
                 )
             except (HTTPException, ProxyException) as exc:
                 # Cold-start MCP OAuth discovery: RFC 9728 / MCP Authorization spec

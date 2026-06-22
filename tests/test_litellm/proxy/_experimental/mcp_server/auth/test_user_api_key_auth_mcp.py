@@ -1,7 +1,7 @@
 import json
 import os
 import sys
-from unittest.mock import AsyncMock, MagicMock, call as mock_call, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -435,13 +435,23 @@ class TestMCPRequestHandler:
             "headers": headers,
         }
 
-        # Create an async mock for user_api_key_auth
-        async def mock_user_api_key_auth(api_key, request):
+        # Create an async mock for user_api_key_auth. The MCP path routes the
+        # caller's key through ``custom_litellm_key_header`` (lenient extraction
+        # that accepts a raw, un-prefixed key); accept both that and the legacy
+        # ``api_key`` kwarg so the mock mirrors the real signature.
+        async def mock_user_api_key_auth(
+            request, custom_litellm_key_header=None, api_key=None, **kwargs
+        ):
+            key = (
+                custom_litellm_key_header
+                if custom_litellm_key_header is not None
+                else api_key
+            )
             return UserAPIKeyAuth(
-                token=("test-token-sha256-empty-hash" if api_key else None),
-                api_key=api_key,
-                user_id="test-user-id" if api_key else None,
-                team_id="test-team-id" if api_key else None,
+                token=("test-token-sha256-empty-hash" if key else None),
+                api_key=key,
+                user_id="test-user-id" if key else None,
+                team_id="test-team-id" if key else None,
                 user_role=None,
                 request_route=None,
             )
@@ -468,6 +478,68 @@ class TestMCPRequestHandler:
             assert mcp_server_auth_headers == expected_server_auth_headers
             # For these tests, mcp_servers should be None
             assert mcp_servers is None
+
+    @pytest.mark.parametrize(
+        "header_name,header_value",
+        [
+            # raw x-litellm-api-key (no "Bearer " prefix) — the documented form
+            ("x-litellm-api-key", "sk-raw-key-no-bearer"),
+            # Bearer-prefixed values must still resolve to the bare token
+            ("x-litellm-api-key", "Bearer sk-raw-key-no-bearer"),
+            ("authorization", "Bearer sk-raw-key-no-bearer"),
+        ],
+    )
+    async def test_process_mcp_request_raw_api_key_survives_extraction(
+        self, header_name, header_value
+    ):
+        """Regression: the MCP streamable-HTTP path calls ``user_api_key_auth``
+        directly, so its ``custom_litellm_key_header`` Security param is never
+        resolved. If the key is passed as the positional ``api_key``, the real
+        ``get_api_key`` applies strict ``_get_bearer_token`` and empties a raw,
+        un-prefixed key — auth then fails and the tool call surfaces to the
+        client as a cancelled/terminated session. Passing it as
+        ``custom_litellm_key_header`` uses the lenient extractor, so a raw key is
+        preserved. This feeds the exact kwargs ``process_mcp_request`` produces
+        into the real ``get_api_key`` and asserts the bare token survives.
+        """
+        from litellm.proxy.auth.user_api_key_auth import get_api_key
+
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "path": "/mcp/some_server",
+            "headers": [(header_name.encode(), header_value.encode())],
+        }
+
+        captured = {}
+
+        async def capture_auth(request, **kwargs):
+            captured.update(kwargs)
+            # Mirror the real builder: run the actual extraction on the kwargs
+            # the MCP path supplied. An unresolved Security default would not be
+            # a str, so model that with None when api_key is not forwarded.
+            extracted, _ = get_api_key(
+                custom_litellm_key_header=kwargs.get("custom_litellm_key_header"),
+                api_key=kwargs.get("api_key"),
+                azure_api_key_header=None,
+                anthropic_api_key_header=None,
+                google_ai_studio_api_key_header=None,
+                azure_apim_header=None,
+                pass_through_endpoints=None,
+                route="/mcp/some_server",
+                request=request,
+            )
+            captured["extracted"] = extracted
+            return UserAPIKeyAuth(api_key=extracted, user_id="u")
+
+        with patch(
+            "litellm.proxy._experimental.mcp_server.auth.user_api_key_auth_mcp.user_api_key_auth",
+            side_effect=capture_auth,
+        ):
+            await MCPRequestHandler.process_mcp_request(scope)
+
+        # The bare token must survive extraction; pre-fix it was emptied to "".
+        assert captured["extracted"] == "sk-raw-key-no-bearer"
 
     @pytest.mark.parametrize(
         "headers,expected_result",
@@ -722,8 +794,17 @@ class TestMCPOAuth2AuthFlow:
             ],
         }
 
-        async def mock_user_api_key_auth(api_key, request):
-            return UserAPIKeyAuth(api_key=api_key, user_id="test-user")
+        async def mock_user_api_key_auth(
+            request, custom_litellm_key_header=None, api_key=None, **kwargs
+        ):
+            return UserAPIKeyAuth(
+                api_key=(
+                    custom_litellm_key_header
+                    if custom_litellm_key_header is not None
+                    else api_key
+                ),
+                user_id="test-user",
+            )
 
         with patch(
             "litellm.proxy._experimental.mcp_server.auth.user_api_key_auth_mcp.user_api_key_auth",
@@ -738,10 +819,14 @@ class TestMCPOAuth2AuthFlow:
                 raw_headers,
             ) = await MCPRequestHandler.process_mcp_request(scope)
 
-            # LiteLLM key should be used for auth
+            # LiteLLM key should be used for auth. The MCP path passes it via
+            # custom_litellm_key_header (lenient extraction that accepts a raw,
+            # un-prefixed key) rather than the positional api_key.
             mock_auth.assert_called_once()
             call_args = mock_auth.call_args
-            assert call_args.kwargs["api_key"] == "sk-litellm-valid-key"
+            assert (
+                call_args.kwargs["custom_litellm_key_header"] == "sk-litellm-valid-key"
+            )
 
             # OAuth2 headers should still contain the Authorization token
             assert (
@@ -762,8 +847,17 @@ class TestMCPOAuth2AuthFlow:
             ],
         }
 
-        async def mock_user_api_key_auth(api_key, request):
-            return UserAPIKeyAuth(api_key=api_key, user_id="test-user")
+        async def mock_user_api_key_auth(
+            request, custom_litellm_key_header=None, api_key=None, **kwargs
+        ):
+            return UserAPIKeyAuth(
+                api_key=(
+                    custom_litellm_key_header
+                    if custom_litellm_key_header is not None
+                    else api_key
+                ),
+                user_id="test-user",
+            )
 
         with patch(
             "litellm.proxy._experimental.mcp_server.auth.user_api_key_auth_mcp.user_api_key_auth",
@@ -800,7 +894,9 @@ class TestMCPOAuth2AuthFlow:
             ],
         }
 
-        async def mock_user_api_key_auth_server_error(api_key, request):
+        async def mock_user_api_key_auth_server_error(
+            request, custom_litellm_key_header=None, api_key=None, **kwargs
+        ):
             raise HTTPException(status_code=500, detail="Internal server error")
 
         with patch(
@@ -830,7 +926,9 @@ class TestMCPOAuth2AuthFlow:
             ],
         }
 
-        async def mock_user_api_key_auth_proxy_exception(api_key, request):
+        async def mock_user_api_key_auth_proxy_exception(
+            request, custom_litellm_key_header=None, api_key=None, **kwargs
+        ):
             raise ProxyException(
                 message="Authentication Error: Invalid API key",
                 type="auth_error",
@@ -872,7 +970,9 @@ class TestMCPOAuth2AuthFlow:
             ],
         }
 
-        async def mock_user_api_key_auth_500(api_key, request):
+        async def mock_user_api_key_auth_500(
+            request, custom_litellm_key_header=None, api_key=None, **kwargs
+        ):
             raise ProxyException(
                 message="Internal error",
                 type="server_error",
@@ -911,7 +1011,9 @@ class TestMCPPublicRouteGuard:
             "headers": [(b"authorization", b"Bearer sk-bogus")],
         }
 
-        async def mock_user_api_key_auth_fails(api_key, request):
+        async def mock_user_api_key_auth_fails(
+            request, custom_litellm_key_header=None, api_key=None, **kwargs
+        ):
             raise HTTPException(status_code=401, detail="Invalid API key")
 
         with (
@@ -944,7 +1046,9 @@ class TestMCPPublicRouteGuard:
             "headers": [(b"authorization", b"Bearer sk-bogus")],
         }
 
-        async def mock_user_api_key_auth_fails(api_key, request):
+        async def mock_user_api_key_auth_fails(
+            request, custom_litellm_key_header=None, api_key=None, **kwargs
+        ):
             raise HTTPException(status_code=401, detail="Invalid API key")
 
         with (
@@ -1000,7 +1104,9 @@ class TestMCPPassthroughColdStartAdmission:
             "headers": [(b"x-mcp-servers", b"passthrough_server")],
         }
 
-        async def mock_user_api_key_auth_fails(api_key, request):
+        async def mock_user_api_key_auth_fails(
+            request, custom_litellm_key_header=None, api_key=None, **kwargs
+        ):
             raise HTTPException(status_code=401, detail="Invalid API key")
 
         with (
@@ -1042,7 +1148,9 @@ class TestMCPPassthroughColdStartAdmission:
             ],
         }
 
-        async def mock_user_api_key_auth_fails(api_key, request):
+        async def mock_user_api_key_auth_fails(
+            request, custom_litellm_key_header=None, api_key=None, **kwargs
+        ):
             raise HTTPException(status_code=401, detail="Invalid API key")
 
         with (
@@ -1072,7 +1180,9 @@ class TestMCPPassthroughColdStartAdmission:
             "headers": [(b"x-mcp-auth", b"Bearer upstream-token")],
         }
 
-        async def mock_user_api_key_auth_fails(api_key, request):
+        async def mock_user_api_key_auth_fails(
+            request, custom_litellm_key_header=None, api_key=None, **kwargs
+        ):
             raise HTTPException(status_code=401, detail="Invalid API key")
 
         with (
@@ -1102,7 +1212,9 @@ class TestMCPPassthroughColdStartAdmission:
             "headers": [],
         }
 
-        async def mock_user_api_key_auth_fails(api_key, request):
+        async def mock_user_api_key_auth_fails(
+            request, custom_litellm_key_header=None, api_key=None, **kwargs
+        ):
             raise HTTPException(status_code=401, detail="Invalid API key")
 
         with (
@@ -1137,7 +1249,9 @@ class TestMCPPassthroughColdStartAdmission:
             "headers": [],
         }
 
-        async def mock_user_api_key_auth_forbidden(api_key, request):
+        async def mock_user_api_key_auth_forbidden(
+            request, custom_litellm_key_header=None, api_key=None, **kwargs
+        ):
             raise HTTPException(status_code=403, detail="Forbidden")
 
         with (
@@ -1167,7 +1281,9 @@ class TestMCPPassthroughColdStartAdmission:
             "headers": [],
         }
 
-        async def mock_user_api_key_auth_server_error(api_key, request):
+        async def mock_user_api_key_auth_server_error(
+            request, custom_litellm_key_header=None, api_key=None, **kwargs
+        ):
             raise ProxyException(
                 message="Internal error",
                 type="server_error",
@@ -1200,7 +1316,9 @@ class TestMCPPassthroughColdStartAdmission:
             "headers": [],
         }
 
-        async def mock_user_api_key_auth_fails(api_key, request):
+        async def mock_user_api_key_auth_fails(
+            request, custom_litellm_key_header=None, api_key=None, **kwargs
+        ):
             raise HTTPException(status_code=401, detail="Invalid API key")
 
         with (
@@ -1232,7 +1350,9 @@ class TestMCPPassthroughColdStartAdmission:
             "headers": [],
         }
 
-        async def mock_user_api_key_auth_fails(api_key, request):
+        async def mock_user_api_key_auth_fails(
+            request, custom_litellm_key_header=None, api_key=None, **kwargs
+        ):
             raise ProxyException(
                 message="Authentication Error",
                 type="auth_error",
@@ -1293,7 +1413,9 @@ class TestMCPOAuth2FallbackTargetGating:
             "headers": [(b"authorization", b"Bearer anything-at-all")],
         }
 
-        async def mock_user_api_key_auth_fails(api_key, request):
+        async def mock_user_api_key_auth_fails(
+            request, custom_litellm_key_header=None, api_key=None, **kwargs
+        ):
             raise HTTPException(status_code=401, detail="Invalid API key")
 
         with (
@@ -1326,7 +1448,9 @@ class TestMCPOAuth2FallbackTargetGating:
             "headers": [(b"authorization", b"Bearer anything")],
         }
 
-        async def mock_user_api_key_auth_fails(api_key, request):
+        async def mock_user_api_key_auth_fails(
+            request, custom_litellm_key_header=None, api_key=None, **kwargs
+        ):
             raise HTTPException(status_code=401, detail="Invalid API key")
 
         with (
@@ -1366,7 +1490,9 @@ class TestMCPOAuth2FallbackTargetGating:
             ],
         }
 
-        async def mock_user_api_key_auth_fails(api_key, request):
+        async def mock_user_api_key_auth_fails(
+            request, custom_litellm_key_header=None, api_key=None, **kwargs
+        ):
             raise HTTPException(status_code=401, detail="Invalid API key")
 
         with (
@@ -1405,7 +1531,9 @@ class TestMCPOAuth2FallbackTargetGating:
             "headers": [(b"authorization", b"Bearer upstream-token-xyz")],
         }
 
-        async def mock_user_api_key_auth_fails(api_key, request):
+        async def mock_user_api_key_auth_fails(
+            request, custom_litellm_key_header=None, api_key=None, **kwargs
+        ):
             raise HTTPException(status_code=401, detail="Invalid API key")
 
         with (
@@ -1437,7 +1565,9 @@ class TestMCPOAuth2FallbackTargetGating:
             "headers": [(b"authorization", b"Bearer upstream-token")],
         }
 
-        async def mock_user_api_key_auth_fails(api_key, request):
+        async def mock_user_api_key_auth_fails(
+            request, custom_litellm_key_header=None, api_key=None, **kwargs
+        ):
             raise HTTPException(status_code=401, detail="Invalid API key")
 
         with (
@@ -1487,7 +1617,9 @@ class TestMCPOAuth2FallbackTargetGating:
             ],
         }
 
-        async def mock_user_api_key_auth_fails(api_key, request):
+        async def mock_user_api_key_auth_fails(
+            request, custom_litellm_key_header=None, api_key=None, **kwargs
+        ):
             raise HTTPException(status_code=401, detail="Invalid API key")
 
         def mock_lookup(name, client_ip=None):
@@ -1526,7 +1658,9 @@ class TestMCPOAuth2FallbackTargetGating:
             "headers": [(b"authorization", b"Bearer anything")],
         }
 
-        async def mock_user_api_key_auth_no_code(api_key, request):
+        async def mock_user_api_key_auth_no_code(
+            request, custom_litellm_key_header=None, api_key=None, **kwargs
+        ):
             raise ProxyException(
                 message="Authentication Error",
                 type="auth_error",
@@ -1723,7 +1857,9 @@ class TestMCPDelegateAuthToUpstream:
             "headers": [],
         }
 
-        async def mock_user_api_key_auth_fails(api_key, request):
+        async def mock_user_api_key_auth_fails(
+            request, custom_litellm_key_header=None, api_key=None, **kwargs
+        ):
             raise HTTPException(status_code=401, detail="Invalid API key")
 
         with (
@@ -1762,7 +1898,9 @@ class TestMCPDelegateAuthToUpstream:
             "headers": [],
         }
 
-        async def mock_user_api_key_auth_fails(api_key, request):
+        async def mock_user_api_key_auth_fails(
+            request, custom_litellm_key_header=None, api_key=None, **kwargs
+        ):
             raise HTTPException(status_code=401, detail="Invalid API key")
 
         with (
@@ -1803,7 +1941,9 @@ class TestMCPDelegateAuthToUpstream:
             ],
         }
 
-        async def mock_user_api_key_auth_fails(api_key, request):
+        async def mock_user_api_key_auth_fails(
+            request, custom_litellm_key_header=None, api_key=None, **kwargs
+        ):
             raise HTTPException(status_code=401, detail="Invalid API key")
 
         def mock_lookup(name, client_ip=None):
@@ -1846,7 +1986,9 @@ class TestMCPDelegateAuthToUpstream:
             "headers": [],
         }
 
-        async def mock_user_api_key_auth_fails(api_key, request):
+        async def mock_user_api_key_auth_fails(
+            request, custom_litellm_key_header=None, api_key=None, **kwargs
+        ):
             raise HTTPException(status_code=401, detail="Invalid API key")
 
         with (
@@ -2481,10 +2623,16 @@ class TestMCPCustomHeaderName:
             }
 
             # Create an async mock for user_api_key_auth
-            async def mock_user_api_key_auth(api_key, request):
+            async def mock_user_api_key_auth(
+                request, custom_litellm_key_header=None, api_key=None, **kwargs
+            ):
                 return UserAPIKeyAuth(
                     token="test-token-sha256-empty-hash",
-                    api_key=api_key,
+                    api_key=(
+                        custom_litellm_key_header
+                        if custom_litellm_key_header is not None
+                        else api_key
+                    ),
                     user_id="test-user-id",
                     team_id="test-team-id",
                     user_role=None,
@@ -2514,7 +2662,7 @@ class TestMCPCustomHeaderName:
                 # Verify the mock was called
                 mock_auth.assert_called_once()
                 call_args = mock_auth.call_args
-                assert call_args.kwargs["api_key"] == "test-api-key"
+                assert call_args.kwargs["custom_litellm_key_header"] == "test-api-key"
 
     def test_get_mcp_server_auth_headers_from_headers(self):
         """Test _get_mcp_server_auth_headers_from_headers method"""
@@ -2656,10 +2804,16 @@ class TestMCPAccessGroupsE2E:
         }
 
         # Create an async mock for user_api_key_auth
-        async def mock_user_api_key_auth(api_key, request):
+        async def mock_user_api_key_auth(
+            request, custom_litellm_key_header=None, api_key=None, **kwargs
+        ):
             return UserAPIKeyAuth(
                 token="test-token-sha256-empty-hash",
-                api_key=api_key,
+                api_key=(
+                    custom_litellm_key_header
+                    if custom_litellm_key_header is not None
+                    else api_key
+                ),
                 user_id="test-user-id",
                 team_id="test-team-id",
                 user_role=None,
@@ -2707,10 +2861,16 @@ class TestMCPAccessGroupsE2E:
         }
 
         # Create an async mock for user_api_key_auth
-        async def mock_user_api_key_auth(api_key, request):
+        async def mock_user_api_key_auth(
+            request, custom_litellm_key_header=None, api_key=None, **kwargs
+        ):
             return UserAPIKeyAuth(
                 token="test-token-sha256-empty-hash",
-                api_key=api_key,
+                api_key=(
+                    custom_litellm_key_header
+                    if custom_litellm_key_header is not None
+                    else api_key
+                ),
                 user_id="test-user-id",
                 team_id="test-team-id",
                 user_role=None,
